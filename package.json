@@ -1,0 +1,21 @@
+{
+  "name": "casa-in-ordine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gestione condivisa delle faccende domestiche (Android, Capacitor)",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --check src/app.js && node tests/backend.test.js && node tests/ui-smoke.test.js",
+    "android:sync": "npm run build && npx cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/android": "6.2.0",
+    "@capacitor/app": "~6.0.0",
+    "@capacitor/core": "6.2.0",
+    "@capacitor/status-bar": "~6.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "6.2.0"
+  },
+  "engines": { "node": ">=18" }
+}

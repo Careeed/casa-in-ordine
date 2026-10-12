@@ -1,0 +1,10 @@
+{
+  "appId": "it.casainordine.app",
+  "appName": "Casa in Ordine",
+  "webDir": "www",
+  "server": { "androidScheme": "https" },
+  "android": { "allowMixedContent": false },
+  "plugins": {
+    "StatusBar": { "style": "LIGHT", "backgroundColor": "#F5F4F0", "overlaysWebView": false }
+  }
+}
