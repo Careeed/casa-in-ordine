@@ -28,13 +28,34 @@ const S = {
   sync: { state: 'idle', last: LS.get('last', null), msg: '' }, tab: 'today', force: false,
   f: { person: 'all', cat: 'all', due: 'all', status: 'active' }, stats: { view: 'stats', range: 'week', from: '', to: '' }, weekOf: weekStart(today())
 };
-const D = () => S.data || { tasks: [], occurrences: [], history: [], people: [], availability: [], settings: [] };
+const EMPTY = { tasks: [], occurrences: [], history: [], people: [], availability: [], settings: [] };
+let VIEW = null;
+/* Dati del server + modifiche ancora in coda applicate in modo PROVVISORIO (con badge "⏳"), così l'app risponde subito.
+   Non vengono mai presentate come sincronizzate finché il server non conferma. */
+function buildView() {
+  const d = S.data || EMPTY, pend = S.outbox.filter(o => o.status === 'pending');
+  if (!pend.length) return d;
+  const v = Object.assign({}, d, { occurrences: d.occurrences.slice(), history: d.history.slice() });
+  pend.forEach(op => {
+    const p = op.payload;
+    if (op.action === 'completeOccurrence') {
+      const o = v.occurrences.find(x => x.id === p.occurrenceId), t = o && d.tasks.find(x => x.id === o.taskId);
+      if (o && t) {
+        v.occurrences = v.occurrences.filter(x => x !== o);
+        if (!v.history.some(h => h.id === 'h_' + op.opId)) v.history.push({ id: 'h_' + op.opId, taskId: t.id, taskName: t.name, category: t.category, frequency: t.frequency, assignee: o.assignee || t.assignee, doneBy: p.doneBy, doneAt: p.doneAt, doneDate: p.doneDate, estMinutes: t.minutes, actualMinutes: p.actualMinutes === '' || p.actualMinutes == null ? '' : Number(p.actualMinutes), effort: t.effort, notes: p.notes || '', pending: true });
+      }
+    } else if (op.action === 'undoCompletion') v.history = v.history.filter(h => h.id !== p.historyId);
+    else if (op.action === 'updateOccurrence') v.occurrences = v.occurrences.map(o => o.id === p.id ? Object.assign({}, o, p.dueDate !== undefined ? { dueDate: p.dueDate } : {}, p.assignee !== undefined ? { assignee: p.assignee } : {}) : o);
+  });
+  return v;
+}
+const D = () => VIEW || (VIEW = buildView());
 const person = id => id === 'both' ? 'Entrambi' : id === 'none' || !id ? 'Non assegnata' : ((D().people.find(p => p.id === id) || {}).name || (id === 'p1' ? 'Persona 1' : 'Paola'));
 const taskOf = id => D().tasks.find(t => t.id === id);
 const eff = o => o.assignee || (taskOf(o.taskId) || {}).assignee || 'none';
 const setting = (k, d) => { const s = D().settings.find(x => x.id === k); return s ? s.value : d; };
 const openOccs = () => D().occurrences.filter(o => o.status === 'open' && taskOf(o.taskId));
-const pendingSet = () => new Set(S.outbox.map(o => o.payload.occurrenceId || o.payload.id || (o.payload.task && o.payload.task.id)).filter(Boolean));
+const pendingSet = () => new Set(S.outbox.map(o => o.payload.occurrenceId || o.payload.historyId || o.payload.id || (o.payload.task && o.payload.task.id)).filter(Boolean));
 const freqLabel = t => t.frequency === 'custom' ? 'Ogni ' + t.intervalDays + ' giorni' : FREQ[t.frequency];
 const opt = (v, l, cur) => '<option value="' + esc(v) + '"' + (String(v) === String(cur) ? ' selected' : '') + '>' + esc(l) + '</option>';
 const saveBox = () => LS.set('outbox', S.outbox);
@@ -56,8 +77,9 @@ async function api(action, payload, cfg) {
 function setSync(state, msg) { S.sync.state = state; S.sync.msg = msg || ''; render(); }
 function applySnap(snap) { S.data = snap; LS.set('data', snap); S.sync.last = new Date().toISOString(); LS.set('last', S.sync.last); S.sync.state = 'ok'; S.sync.msg = ''; }
 function enqueue(action, payload, label) {
-  S.outbox.push({ opId: uid('op'), action: action, payload: payload, label: label, status: 'pending', err: '' });
-  saveBox(); render(); flush();
+  const op = { opId: uid('op'), action: action, payload: payload, label: label, status: 'pending', err: '' };
+  S.outbox.push(op); saveBox(); render(); flush();
+  return op;
 }
 let flushing = false;
 async function flush() {
@@ -77,12 +99,19 @@ async function flush() {
     }
   } finally { flushing = false; saveBox(); render(); }
 }
-async function refresh() {
+async function refresh(force) {
   if (!S.cfg.url || !S.cfg.token) return;
-  setSync('syncing');
+  const full = force || !S.data;
+  if (full) setSync('syncing');
+  const before = S.sync.last;
   await flush();
   if (S.outbox.some(o => o.status === 'pending')) { render(); return; } // ancora modifiche non confermate: non sovrascrivere la vista
-  try { const r = await api('sync'); applySnap(r.snapshot); } catch (e) { S.sync.state = e.network ? 'offline' : 'error'; S.sync.msg = e.message; }
+  if (S.sync.last !== before) { render(); return; } // la risposta alle scritture conteneva già i dati aggiornati
+  try {
+    // Controllo leggero: se la revisione non è cambiata il server risponde subito, senza dati.
+    const r = await api('sync', { rev: full ? null : S.data.rev });
+    if (r.unchanged) { S.sync.last = new Date().toISOString(); LS.set('last', S.sync.last); S.sync.state = 'ok'; S.sync.msg = ''; } else applySnap(r.snapshot);
+  } catch (e) { S.sync.state = e.network ? 'offline' : 'error'; S.sync.msg = e.message; }
   render();
 }
 
@@ -100,7 +129,7 @@ function freeMin(pid, date) {
 }
 
 /* ---------- UI di base ---------- */
-function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.remove('hid'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.add('hid'), 3200); }
+function toast(msg, undoId) { const t = $('#toast'); t.innerHTML = '<span>' + esc(msg) + '</span>' + (undoId ? '<button class="btn sm" data-act="undoNow" data-id="' + esc(undoId) + '">Annulla</button>' : ''); t.classList.remove('hid'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.add('hid'), undoId ? 7000 : 3200); }
 function sheet(html) { const s = $('#sheet'); s.innerHTML = '<div class="backdrop" data-act="closeSheet"></div><div class="panel">' + html + '<button class="btn ghost" data-act="closeSheet">Chiudi</button></div>'; s.classList.remove('hid'); }
 const closeSheet = () => { $('#sheet').classList.add('hid'); $('#sheet').innerHTML = ''; };
 const sheetOpen = () => !$('#sheet').classList.contains('hid');
@@ -118,6 +147,7 @@ function chip() {
 }
 let lastMain = '';
 function render() {
+  VIEW = null;
   const cfgd = S.cfg.url && S.cfg.token, main = $('#main'), ae = document.activeElement;
   const typing = ae && main.contains(ae) && /INPUT|TEXTAREA|SELECT/.test(ae.tagName);
   const titles = { today: 'Oggi', tasks: 'Mansioni', cal: 'Calendario', stats: 'Statistiche', settings: 'Impostazioni' };
@@ -140,7 +170,7 @@ function filters(kind) {
   const sel = (k, o) => '<select data-f="' + k + '" aria-label="Filtro ' + k + '">' + o.map(x => opt(x[0], x[1], S.f[k])).join('') + '</select>';
   return '<div class="filters">' + sel('person', [['all', 'Tutti'], ['p1', person('p1')], ['p2', person('p2')], ['none', 'Non assegnate']]) +
     sel('cat', [['all', 'Categorie']].concat(CATS.map(c => [c, c]))) +
-    (kind === 'today' ? sel('due', [['all', 'Scadenze'], ['overdue', 'Scadute'], ['today', 'Oggi'], ['week', '7 giorni']]) : sel('status', [['active', 'Attive'], ['archived', 'Archiviate'], ['all', 'Tutte']])) + '</div>';
+    (kind === 'today' ? sel('due', [['all', 'Scadenze'], ['overdue', 'Scadute'], ['today', 'Oggi'], ['week', '7 giorni']]) : kind === 'hist' ? '' : sel('status', [['active', 'Attive'], ['archived', 'Archiviate'], ['all', 'Tutte']])) + '</div>';
 }
 function occCard(o, pend) {
   const t = taskOf(o.taskId), late = o.dueDate < today();
@@ -158,7 +188,16 @@ function todayView() {
   const show = k => S.f.due === 'all' || S.f.due === k;
   const sec = (title, arr, k) => show(k) && arr.length ? '<h3>' + title + ' (' + arr.length + ')</h3>' + arr.sort(by).map(o => occCard(o, pend)).join('') : '';
   const html = sec('Scadute', L.filter(o => o.dueDate < t), 'overdue') + sec('Oggi', L.filter(o => o.dueDate === t), 'today') + sec('Prossime scadenze', L.filter(o => o.dueDate > t && o.dueDate <= addD(t, 7)), 'week');
-  return weekSummary() + filters('today') + (html || '<p class="empty">Nessuna mansione da mostrare con questi filtri.</p>');
+  return weekSummary() + filters('today') + (html || '<p class="empty">Nessuna mansione da mostrare con questi filtri.</p>') + doneToday();
+}
+function histCard(h) {
+  const min = h.actualMinutes !== '' && h.actualMinutes != null ? h.actualMinutes + ' min effettivi' : h.estMinutes + ' min stimati';
+  return '<div class="card occ"><div class="grow"><b>✓ ' + esc(h.taskName) + '</b><div class="meta">' + esc(h.category) + ' · ' + esc(person(h.doneBy)) + ' · ' + fmtDay(h.doneDate) + ' ' + fmtTime(h.doneAt) + ' · ' + min + (h.notes ? ' · ' + esc(h.notes) : '') + '</div>' +
+    (h.pending ? '<span class="badge">⏳ in attesa di conferma</span>' : '') + '</div><button class="btn sm" data-act="undo" data-id="' + esc(h.id) + '">Annulla</button></div>';
+}
+function doneToday() {
+  const t = today(), L = D().history.filter(h => h.doneDate === t).sort((a, b) => String(b.doneAt).localeCompare(String(a.doneAt)));
+  return '<h3>Completate oggi (' + L.length + ')</h3>' + (L.map(histCard).join('') || '<p class="meta">Ancora nessuna.</p>') + '<button class="btn" data-act="allDone">Vedi tutte le completate</button>';
 }
 function completeSheet(id) {
   const o = D().occurrences.find(x => x.id === id); if (!o) return; const t = taskOf(o.taskId);
@@ -298,8 +337,9 @@ function balView(from, to) {
   return out;
 }
 function histView() {
-  const L = D().history.slice().sort((a, b) => String(b.doneAt).localeCompare(String(a.doneAt))).slice(0, 150);
-  return '<button class="btn" data-act="exportCsv">Esporta CSV (condividi o copia)</button>' + (L.map(h => '<div class="card"><b>' + esc(h.taskName) + '</b><div class="meta">' + esc(h.category) + ' · ' + esc(person(h.doneBy)) + ' · ' + fmtDay(h.doneDate) + ' ' + fmtTime(h.doneAt) + ' · ' + (h.actualMinutes !== '' ? h.actualMinutes + ' min effettivi' : h.estMinutes + ' min stimati') + (h.notes ? ' · ' + esc(h.notes) : '') + '</div></div>').join('') || '<p class="empty">Ancora nessun completamento.</p>') + (D().history.length > 150 ? '<p class="meta">Mostrati gli ultimi 150; il CSV contiene tutto.</p>' : '');
+  const all = D().history.filter(h => pm(h.doneBy) && (S.f.cat === 'all' || h.category === S.f.cat)).sort((a, b) => String(b.doneAt).localeCompare(String(a.doneAt)));
+  return filters('hist') + '<button class="btn" data-act="exportCsv">Esporta CSV (condividi o copia)</button>' + (all.slice(0, 150).map(histCard).join('') || '<p class="empty">Nessun completamento con questi filtri.</p>') +
+    (all.length > 150 ? '<p class="meta">Mostrati gli ultimi 150 di ' + all.length + '; il CSV contiene tutto.</p>' : '') + '<p class="meta">Hai sbagliato a completare? Tocca "Annulla": l\'attività torna da fare e sparisce dalle statistiche.</p>';
 }
 function csv() {
   const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"', H = ['id', 'mansione', 'categoria', 'svolta_da', 'data', 'ora', 'minuti_stimati', 'minuti_effettivi', 'impegno_1_5', 'note'];
@@ -324,7 +364,7 @@ function settingsView() {
     '<label>Tetto giornaliero di tempo per la casa (minuti)<input name="cap" type="number" min="0" max="1440" value="' + esc(setting('dailyCapMin', 120)) + '"></label><button class="btn" data-act="saveGeneral">Salva</button></div>' +
     '<h3>Disponibilità e lavoro</h3><p class="meta">Essere a casa non significa essere liberi: inserisci orari di lavoro, impegni ricorrenti, fasce libere e giorni di indisponibilità.</p>' +
     ['p1', 'p2'].map(p => '<div class="meta"><b>' + esc(person(p)) + '</b></div>' + av(p) + '<button class="btn sm" data-act="availNew" data-id="' + p + '">+ Aggiungi per ' + esc(person(p)) + '</button>').join('<br><br>') +
-    '<h3>Dati e dispositivo</h3><button class="btn" data-act="refresh">Aggiorna ora</button><button class="btn danger" data-act="logout">Rimuovi configurazione da questo telefono</button><p class="meta">Versione 1.0.0 · aggiornamento automatico ogni 45 secondi quando l\'app è aperta.</p>';
+    '<h3>Dati e dispositivo</h3><button class="btn" data-act="refresh">Aggiorna ora</button><button class="btn danger" data-act="logout">Rimuovi configurazione da questo telefono</button><p class="meta">Versione 1.1.0 · controllo automatico ogni 20 secondi quando l\'app è aperta.</p>';
 }
 function availSheet(id, pid) {
   const a = id ? D().availability.find(x => x.id === id) : { personId: pid || 'p1', type: 'lavoro', weekdays: '1,2,3,4,5', start: '09:00', end: '18:00', dateFrom: today(), dateTo: today(), label: '' };
@@ -344,7 +384,7 @@ function pendingSheet() {
 /* ---------- azioni ---------- */
 const ACT = {
   tab(el, id) { S.tab = id; render(); $('#main').scrollTop = 0; },
-  refresh() { refresh(); },
+  refresh() { refresh(true); },
   done(el, id, e) { e.stopPropagation(); completeSheet(id); },
   occ(el, id) { occSheet(id); },
   seg(el) { Array.from(el.parentNode.children).forEach(b => b.classList.remove('on')); el.classList.add('on'); },
@@ -352,8 +392,8 @@ const ACT = {
   doComplete(el, id) {
     const o = D().occurrences.find(x => x.id === id), t = o && taskOf(o.taskId); if (!t) return closeSheet();
     const by = segVal('doneBy'); if (!by) return toast('Scegli chi l\'ha fatta.');
-    enqueue('completeOccurrence', { occurrenceId: id, doneBy: by, doneAt: new Date().toISOString(), doneDate: today(), actualMinutes: val('actual'), notes: val('notes') }, 'Completa «' + t.name + '»');
-    closeSheet();
+    const op = enqueue('completeOccurrence', { occurrenceId: id, doneBy: by, doneAt: new Date().toISOString(), doneDate: today(), actualMinutes: val('actual'), notes: val('notes') }, 'Completa «' + t.name + '»');
+    closeSheet(); toast('Completata ✓', 'h_' + op.opId);
   },
   newTask() { taskSheet(); }, task(el, id) { taskSheet(id); },
   saveTask(el, id) {
@@ -385,6 +425,9 @@ const ACT = {
     boxes.forEach(b => { const p = proposal[Number(b.dataset.i)]; S.outbox.push({ opId: uid('op'), action: 'updateOccurrence', payload: { id: p.id, baseVersion: p.version, assignee: p.to }, label: 'Assegna «' + p.name + '» a ' + person(p.to), status: 'pending', err: '' }); });
     saveBox(); closeSheet(); render(); flush();
   },
+  allDone() { S.tab = 'stats'; S.stats.view = 'hist'; render(); $('#main').scrollTop = 0; },
+  undo(el, id) { const h = D().history.find(x => x.id === id); if (!h) return; if (!confirm('Annullare il completamento di «' + h.taskName + '»? L\'attività tornerà da fare e sparirà dalle statistiche.')) return; enqueue('undoCompletion', { historyId: id }, 'Annulla completamento «' + h.taskName + '»'); },
+  undoNow(el, id) { const h = D().history.find(x => x.id === id); $('#toast').classList.add('hid'); if (h) enqueue('undoCompletion', { historyId: id }, 'Annulla completamento «' + h.taskName + '»'); },
   sview(el, id) { S.stats.view = id; render(); }, srange(el, id) { S.stats.range = id; render(); },
   async exportCsv() {
     const text = csv(), file = new File([text], 'casa-in-ordine-storico.csv', { type: 'text/csv' });
@@ -396,7 +439,7 @@ const ACT = {
     if (!/^https:\/\/script\.google\.com\//.test(url) || !/\/exec$/.test(url)) return toast('L\'URL deve iniziare con https://script.google.com/ e finire con /exec');
     if (token.length < 24) return toast('Token troppo corto.');
     toast('Verifica in corso…');
-    try { const r = await api('ping', {}, { url: url, token: token }); S.cfg = { url: url, token: token, me: r.user }; LS.set('cfg', S.cfg); S.tab = 'today'; toast('Connesso come ' + (r.user === 'p1' ? 'Persona 1' : 'Persona 2')); render(); refresh(); }
+    try { const r = await api('ping', {}, { url: url, token: token }); S.cfg = { url: url, token: token, me: r.user }; LS.set('cfg', S.cfg); S.tab = 'today'; toast('Connesso come ' + (r.user === 'p1' ? 'Persona 1' : 'Persona 2')); render(); refresh(true); }
     catch (e) { toast(e.message || 'Errore di connessione'); }
   },
   savePeople() { [['p1', 'n1'], ['p2', 'n2']].forEach(x => { const n = val0(x[1]), cur = D().people.find(p => p.id === x[0]); if (n && (!cur || cur.name !== n)) enqueue('savePerson', { id: x[0], name: n, baseVersion: cur ? cur.version : 0 }, 'Nome ' + n); }); },
@@ -410,7 +453,7 @@ const ACT = {
   },
   delAvail(el, id) { const a = D().availability.find(x => x.id === id); if (!confirm('Eliminare questa disponibilità?')) return; enqueue('deleteAvailability', { id: id, baseVersion: a.version }, 'Elimina disponibilità'); closeSheet(); },
   pending() { pendingSheet(); },
-  retry() { closeSheet(); refresh(); },
+  retry() { closeSheet(); refresh(true); },
   discard(el, id) { S.outbox.splice(Number(id), 1); saveBox(); render(); pendingSheet(); },
   logout() { if (!confirm('Rimuovere URL, token e dati locali da questo telefono? Le modifiche non ancora confermate andranno perse.')) return; ['cfg', 'data', 'outbox', 'last'].forEach(k => localStorage.removeItem(k)); S.cfg = { url: '', token: '', me: '' }; S.data = null; S.outbox = []; S.sync = { state: 'idle', last: null, msg: '' }; render(); }
 };
@@ -429,8 +472,9 @@ document.addEventListener('change', e => {
 const AppPlugin = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
 if (AppPlugin) AppPlugin.addListener('backButton', () => { if (sheetOpen()) closeSheet(); else if (S.tab !== 'today') { S.tab = 'today'; S.force = true; render(); S.force = false; } else AppPlugin.exitApp(); });
 
-setInterval(() => { if (!document.hidden) refresh(); }, 45000);
+let ticks = 0;
+setInterval(() => { if (!document.hidden) refresh(++ticks % 15 === 0); }, 20000); // controllo leggero ogni 20 s, scarico completo ogni 5 minuti
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 window.addEventListener('online', () => refresh());
-render(); refresh();
+render(); refresh(true);
 })();
