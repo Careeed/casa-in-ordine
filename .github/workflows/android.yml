@@ -33,6 +33,11 @@ jobs:
         run: |
           if [ ! -d android ]; then npx cap add android; fi
 
+      - name: Applica icona (scopa) e schermata iniziale
+        run: |
+          cp -r resources/android/res/. android/app/src/main/res/
+          find android/app/src/main/res -name 'splash.png' -exec cp resources/android/splash.png {} \;
+
       - name: Sincronizza Capacitor
         run: npx cap sync android
 
