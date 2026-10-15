@@ -50,3 +50,5 @@ table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:6px 4px;b
 .day{border-left:4px solid var(--line)}.day.over{border-left-color:var(--warn)}.day.today{border-left-color:var(--acc)}
 .day .it{display:flex;justify-content:space-between;gap:8px;padding:10px 0;border-top:1px solid var(--line);font-size:15px}
 .note{font-size:13px;color:var(--mut);background:var(--sf);border:1px dashed var(--line);border-radius:12px;padding:10px 12px;margin:10px 0}
+#toast{display:flex;justify-content:space-between;align-items:center;gap:10px}
+#toast .btn.sm{background:#fff;color:var(--ink);border:0;flex:none}
