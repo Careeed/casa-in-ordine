@@ -3,7 +3,7 @@
  * Autenticazione: token segreti per persona, salvati nelle Proprietà dello script
  * (mai nel codice, mai nell'APK). Vedi README.
  */
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 
 const COLS = {
   tasks: ['id', 'name', 'description', 'category', 'assignee', 'frequency', 'intervalDays', 'minutes', 'effort', 'priority', 'status', 'notes', 'checklist', 'createdBy', 'createdAt', 'updatedAt', 'version', 'deleted'],
@@ -12,9 +12,10 @@ const COLS = {
   people: ['id', 'name', 'updatedAt', 'version'],
   availability: ['id', 'personId', 'type', 'weekdays', 'start', 'end', 'dateFrom', 'dateTo', 'label', 'updatedAt', 'version', 'deleted'],
   settings: ['id', 'value', 'updatedAt', 'version'],
-  ops: ['id', 'action', 'at']
+  ops: ['id', 'action', 'at'],
+  undone: ['id', 'by', 'at'] // completamenti annullati (lo storico originale resta come traccia)
 };
-const TITLES = { tasks: 'Mansioni', occurrences: 'Occorrenze', history: 'Storico', people: 'Persone', availability: 'Disponibilita', settings: 'Impostazioni', ops: 'Operazioni' };
+const TITLES = { tasks: 'Mansioni', occurrences: 'Occorrenze', history: 'Storico', people: 'Persone', availability: 'Disponibilita', settings: 'Impostazioni', ops: 'Operazioni', undone: 'Annullati' };
 const NUM = { intervalDays: 1, minutes: 1, effort: 1, version: 1, estMinutes: 1, actualMinutes: 1 };
 const ASSIGNEES = ['p1', 'p2', 'both', 'none'];
 const FREQS = ['once', 'daily', 'weekly', 'biweekly', 'monthly', 'custom'];
@@ -128,11 +129,10 @@ function same_(a, b) {
   for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return d === 0;
 }
-function auth_(token) {
+function auth_(token, props) {
   const cache = CacheService.getScriptCache();
   if (Number(cache.get('fails') || 0) >= 10) throw fail_('locked', 'Troppi tentativi errati. Riprova tra 10 minuti.');
-  const props = PropertiesService.getScriptProperties();
-  const t1 = props.getProperty('TOKEN_P1'), t2 = props.getProperty('TOKEN_P2');
+  const t1 = props.TOKEN_P1, t2 = props.TOKEN_P2;
   if (!t1 || !t2) throw fail_('not_configured', 'Token non configurati: esegui generaTokenAccesso nello Script.');
   const tok = String(token || '');
   const m1 = same_(tok, t1), m2 = same_(tok, t2);
@@ -158,45 +158,72 @@ function doPost(e) {
   let out;
   try {
     const req = JSON.parse(e.postData.contents);
-    const user = auth_(req.token);
-    out = route_(req, user);
+    const props = PropertiesService.getScriptProperties().getProperties(); // una sola lettura: token + revisione
+    const user = auth_(req.token, props);
+    out = route_(req, user, props);
   } catch (err) {
     out = { ok: false, code: err.code || 'error', message: err.code ? err.message : 'Errore del server: ' + err.message };
-    if (err.code === 'conflict') { try { out.snapshot = snapshot_(); } catch (x) { /* ignora */ } }
+    if (err.code === 'conflict') { try { out.snapshot = snapshot_(getRev_()); } catch (x) { /* ignora */ } }
   }
   return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
 }
 
 const WRITES = {
   saveTask: saveTask_, deleteTask: deleteTask_, completeOccurrence: completeOccurrence_, updateOccurrence: updateOccurrence_,
-  savePerson: savePerson_, saveAvailability: saveAvailability_, deleteAvailability: deleteAvailability_, saveSetting: saveSetting_
+  undoCompletion: undoCompletion_, savePerson: savePerson_, saveAvailability: saveAvailability_, deleteAvailability: deleteAvailability_, saveSetting: saveSetting_
 };
-function route_(req, user) {
+function getRev_() { return PropertiesService.getScriptProperties().getProperty('REV') || '0'; }
+function bumpRev_() { const p = PropertiesService.getScriptProperties(), r = String(Number(p.getProperty('REV') || 0) + 1); p.setProperty('REV', r); return r; }
+/** Da eseguire dall'editor se modifichi il foglio a mano: forza i telefoni a riscaricare tutto. */
+function forzaAggiornamento() { bumpRev_(); Logger.log('I telefoni riscaricheranno i dati al prossimo aggiornamento.'); }
+
+function route_(req, user, props) {
   if (req.action === 'ping') return { ok: true, user: user, version: APP_VERSION };
   if (req.action === 'sync') {
-    if (sheet_('people').getLastRow() < 2) lock_(seed_);
-    return { ok: true, snapshot: snapshot_() };
+    let rev = props.REV || '0';
+    if (sheet_('people').getLastRow() < 2) { lock_(seed_); rev = getRev_(); }
+    if (req.rev != null && String(req.rev) === String(rev)) return { ok: true, unchanged: true, rev: rev }; // nessuna novità: risposta immediata
+    return { ok: true, snapshot: cachedSnapshot_(rev) };
   }
   const fn = WRITES[req.action];
   if (!fn) throw fail_('bad_request', 'Azione sconosciuta.');
   if (!req.opId || String(req.opId).length < 8) throw fail_('bad_request', 'opId mancante.');
   return lock_(() => {
-    if (rowOf_('ops', req.opId)) return { ok: true, duplicate: true, snapshot: snapshot_() }; // idempotenza
+    if (rowOf_('ops', req.opId)) return { ok: true, duplicate: true, snapshot: cachedSnapshot_(getRev_()) }; // idempotenza
     fn(req, user);
-    put_('ops', { id: req.opId, action: req.action, at: iso_() });
-    return { ok: true, snapshot: snapshot_() };
+    appendMany_('ops', [{ id: req.opId, action: req.action, at: iso_() }]);
+    return { ok: true, snapshot: cachedSnapshot_(bumpRev_()) };
   });
 }
-function snapshot_() {
+function snapshot_(rev) {
+  const undone = {};
+  readAll_('undone').forEach(u => { undone[u.id] = 1; });
   return {
-    serverTime: iso_(),
+    rev: String(rev), serverTime: iso_(),
     tasks: readAll_('tasks').filter(t => t.deleted !== 'true'),
     occurrences: readAll_('occurrences').filter(o => o.status === 'open'),
-    history: readAll_('history'),
+    history: readAll_('history').filter(h => !undone[h.id]),
     people: readAll_('people'),
     availability: readAll_('availability').filter(a => a.deleted !== 'true'),
     settings: readAll_('settings')
   };
+}
+/** Istantanea in cache per revisione: le letture dal foglio sono lente, la cache no. */
+function cachedSnapshot_(rev) {
+  const c = CacheService.getScriptCache(), n = Number(c.get('sn:' + rev) || 0);
+  if (n) {
+    const keys = []; for (let i = 0; i < n; i++) keys.push('sp:' + rev + ':' + i);
+    const got = c.getAll(keys); let txt = '', ok = true;
+    keys.forEach(k => { if (got[k] == null) ok = false; else txt += got[k]; });
+    if (ok) { try { return JSON.parse(txt); } catch (e) { /* ricostruisci */ } }
+  }
+  const snap = snapshot_(rev);
+  try {
+    const txt = JSON.stringify(snap), parts = {}; let k = 0;
+    for (let i = 0; i < txt.length; i += 30000) parts['sp:' + rev + ':' + (k++)] = txt.slice(i, i + 30000);
+    if (k <= 200) { parts['sn:' + rev] = String(k); c.putAll(parts, 21600); }
+  } catch (e) { /* la cache è solo un'ottimizzazione */ }
+  return snap;
 }
 
 /* ---------- operazioni di scrittura (sempre sotto lock) ---------- */
@@ -219,10 +246,10 @@ function pickTask_(t) {
   };
 }
 function newOcc_(taskId, due) {
-  put_('occurrences', { id: newId_('o'), taskId: taskId, dueDate: due, status: 'open', assignee: '', doneBy: '', doneAt: '', updatedAt: iso_(), version: 1 });
+  appendMany_('occurrences', [{ id: newId_('o'), taskId: taskId, dueDate: due, status: 'open', assignee: '', doneBy: '', doneAt: '', updatedAt: iso_(), version: 1 }]);
 }
-function cancelOpens_(taskId) {
-  readAll_('occurrences').filter(o => o.taskId === taskId && o.status === 'open').forEach(o => {
+function cancelOpens_(taskId, exceptId) {
+  readAll_('occurrences').filter(o => o.taskId === taskId && o.status === 'open' && o.id !== exceptId).forEach(o => {
     o.status = 'cancelled'; o.updatedAt = iso_(); o.version += 1; put_('occurrences', o);
   });
 }
@@ -268,17 +295,29 @@ function completeOccurrence_(req, user) {
     if (!(actual >= 0 && actual <= 1440)) throw fail_('bad_request', 'Durata effettiva non valida.');
   }
   const doneAt = String(req.doneAt || iso_());
-  put_('history', {
+  appendMany_('history', [{
     id: 'h_' + req.opId, opId: req.opId, occurrenceId: o.id, taskId: task.id, taskName: task.name, category: task.category, frequency: task.frequency,
     assignee: o.assignee || task.assignee, doneBy: req.doneBy, doneAt: doneAt, doneDate: req.doneDate, estMinutes: task.minutes,
     actualMinutes: actual, effort: task.effort, notes: String(req.notes || '').slice(0, 500), createdBy: user
-  });
+  }]);
   o.status = 'done'; o.doneBy = req.doneBy; o.doneAt = doneAt; o.updatedAt = iso_(); o.version += 1;
   put_('occurrences', o);
   if (task.frequency !== 'once' && task.status === 'active') {
     const hasOpen = readAll_('occurrences').some(x => x.taskId === task.id && x.status === 'open');
     const nd = nextDue_(task, o.dueDate, req.doneDate);
     if (!hasOpen && nd) newOcc_(task.id, nd);
+  }
+}
+function undoCompletion_(req, user) {
+  const h = get_('history', req.historyId);
+  if (!h) throw fail_('conflict', 'Completamento non trovato.');
+  if (rowOf_('undone', h.id)) return; // già annullato: nessun effetto
+  appendMany_('undone', [{ id: h.id, by: user, at: iso_() }]);
+  const o = get_('occurrences', h.occurrenceId), task = get_('tasks', h.taskId);
+  if (o && o.status === 'done' && task && task.deleted !== 'true' && task.status === 'active') {
+    o.status = 'open'; o.doneBy = ''; o.doneAt = ''; o.updatedAt = iso_(); o.version += 1; // l'attività torna da fare
+    put_('occurrences', o);
+    cancelOpens_(task.id, o.id); // elimina l'occorrenza successiva generata dal completamento: una sola aperta per mansione
   }
 }
 function updateOccurrence_(req) {
@@ -365,6 +404,7 @@ function seed_() {
   });
   appendMany_('tasks', tasks);
   appendMany_('occurrences', occs);
+  bumpRev_();
 }
 /** Da eseguire una volta dall'editor: crea i fogli e le mansioni di partenza. Si può rilanciare senza rischi. */
 function setup() {
