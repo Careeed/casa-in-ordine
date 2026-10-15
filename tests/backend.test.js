@@ -21,8 +21,8 @@ const ctx = {
     getSheetByName: n => sheets[n] || null, insertSheet: n => (sheets[n] = new Sheet(n)),
     getSheets: () => Object.values(sheets), deleteSheet: s => delete sheets[s.name] }) },
   LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock() {} }) },
-  PropertiesService: { getScriptProperties: () => ({ getProperty: k => props[k] || null, setProperties: o => Object.assign(props, o) }) },
-  CacheService: { getScriptCache: () => ({ get: k => cache[k] || null, put: (k, v) => { cache[k] = v; } }) },
+  PropertiesService: { getScriptProperties: () => ({ getProperty: k => props[k] || null, setProperty: (k, v) => { props[k] = v; }, getProperties: () => Object.assign({}, props), setProperties: o => Object.assign(props, o) }) },
+  CacheService: { getScriptCache: () => ({ get: k => cache[k] || null, put: (k, v) => { cache[k] = v; }, getAll: ks => Object.fromEntries(ks.filter(k => k in cache).map(k => [k, cache[k]])), putAll: o => Object.assign(cache, o) }) },
   Utilities: { getUuid: () => crypto.randomUUID(), formatDate: d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` },
   Session: { getScriptTimeZone: () => 'Europe/Rome' },
   ContentService: { createTextOutput: s => ({ setMimeType: () => s }), MimeType: { JSON: 'json' } },
@@ -90,6 +90,25 @@ r = call(T1, 'completeOccurrence', { opId: op(), occurrenceId: once.id, doneBy: 
 assert.strictEqual(r.snapshot.occurrences.filter(o => o.taskId === tid).length, 0, 'una tantum non si rigenera');
 r = call(T1, 'deleteTask', { opId: op(), id: tid, baseVersion: 2 }); assert(r.ok);
 assert(!r.snapshot.tasks.some(t => t.id === tid)); assert(r.snapshot.history.some(h => h.taskId === tid), 'storico conservato');
+
+// annullamento di un completamento (clic sbagliato)
+let rs = call(T1, 'undoCompletion', { opId: op(), historyId: 'h_' + id1 });
+assert(rs.ok, JSON.stringify(rs));
+assert(!rs.snapshot.history.some(h => h.id === 'h_' + id1), 'sparisce dallo storico/statistiche');
+opens = rs.snapshot.occurrences.filter(o => o.taskId === task.id);
+assert.strictEqual(opens.length, 1, 'una sola occorrenza aperta dopo l\'annullamento');
+assert.strictEqual(opens[0].id, occ.id, 'torna aperta l\'occorrenza originale');
+rs = call(T1, 'undoCompletion', { opId: op(), historyId: 'h_' + id1 }); assert(rs.ok, 'annullare due volte non fa danni');
+assert.strictEqual(call(T1, 'undoCompletion', { opId: op(), historyId: 'h_inesistente' }).code, 'conflict');
+// si può completare di nuovo dopo l'annullamento, senza duplicati
+rs = call(T2, 'completeOccurrence', { opId: op(), occurrenceId: occ.id, doneBy: 'p2', doneAt: new Date().toISOString(), doneDate: TODAY });
+assert(rs.ok); assert.strictEqual(rs.snapshot.occurrences.filter(o => o.taskId === task.id).length, 1);
+// sincronizzazione leggera per revisione
+const full = call(T1, 'sync').snapshot, again = call(T1, 'sync', { rev: full.rev });
+assert(again.ok && again.unchanged && !again.snapshot, 'nessuna novità: risposta senza dati');
+assert(call(T1, 'sync', { rev: '0' }).snapshot, 'revisione diversa: dati completi');
+const w = call(T1, 'saveSetting', { opId: op(), key: 'dailyCapMin', value: '90' });
+assert(w.snapshot.rev !== full.rev && call(T2, 'sync', { rev: full.rev }).snapshot.settings.find(x => x.id === 'dailyCapMin').value === '90', 'una scrittura invalida la revisione degli altri telefoni');
 
 // validazione
 assert.strictEqual(call(T1, 'saveSetting', { opId: op(), key: 'dayStart', value: '99:99' }).code, 'bad_request');
