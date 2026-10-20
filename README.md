@@ -42,7 +42,7 @@ Creare il Google Sheet, pubblicare lo script con il tuo account Google, creare l
 
 ## 5. Avviare GitHub Actions
 - Parte da sola a ogni push su `main`/`master`. Oppure: scheda **Actions → "Build APK debug" → Run workflow**.
-- Durata tipica: 5-10 minuti. Il workflow esegue: `npm install` → test → `npm run build` → crea il progetto Android (`npx cap add android`, solo se la cartella `android/` non esiste) → `npx cap sync android` → `./gradlew assembleDebug` → pubblica l'APK.
+- Durata tipica: 5-10 minuti. Il workflow esegue: `npm install` → test → `npm run build` → crea il progetto Android (`npx cap add android`, solo se la cartella `android/` non esiste) → applica l'icona → `npx cap sync android` → `./gradlew assembleDebug` → pubblica l'APK.
 
 ## 6. Scaricare l'APK
 1. **Actions →** apri l'esecuzione completata (spunta verde).
@@ -61,9 +61,23 @@ Creare il Google Sheet, pubblicare lo script con il tuo account Google, creare l
 
 ## 9. Verificare la sincronizzazione tra i due telefoni
 1. Sul telefono A: *Mansioni → ＋* crea "Prova", scadenza oggi, salva.
-2. Sul telefono B: tocca ⟳ in alto (oppure aspetta fino a 45 secondi): "Prova" deve comparire in **Oggi**.
+2. Sul telefono B: tocca ⟳ in alto (oppure aspetta entro circa 6 secondi): "Prova" deve comparire in **Oggi**.
 3. Su B completa "Prova" con ✓; su A aggiorna: sparisce da Oggi e compare in *Statistiche → Storico*.
 4. Prova offline: modalità aereo, completa un'attività → compare il banner "non ancora confermata"; riattiva la rete e la modifica viene inviata e confermata.
+
+## Novità della versione 1.1
+- **Icona**: scopa stilizzata (adattiva, tonda e quadrata). La applica il workflow dopo aver generato il progetto Android, usando i file in `resources/android/`. Per ridisegnarla: modifica `scripts/make-icons.py` e rilancialo (serve Pillow).
+- **Completate e Annulla**: in *Oggi* c'è la sezione "Completate oggi" e il pulsante "Vedi tutte le completate" (storico con filtri per persona e categoria). Ogni completamento ha **Annulla**: l'attività torna da fare e sparisce dalle statistiche. Subito dopo aver completato compare anche un "Annulla" rapido. Lo storico originale resta nel foglio *Storico*, con l'annullamento registrato nel foglio *Annullati*.
+- **Più veloce**: le modifiche compaiono subito sullo schermo, marcate "⏳ in attesa" finché il server non conferma. Il controllo periodico (ogni 20 s) è leggero: se non è cambiato nulla il server risponde subito senza ricaricare il foglio. Il server tiene i dati in cache e usa una "revisione" per capire se c'è qualcosa di nuovo.
+- **Aggiornare il backend (obbligatorio)**: incolla il nuovo `backend/Code.gs` in Apps Script, salva, poi **Distribuisci → Gestisci distribuzioni → Modifica (matita) → Versione: Nuova versione → Distribuisci**. L'URL e i token restano gli stessi. Se modifichi il foglio a mano, esegui la funzione `forzaAggiornamento` per far riscaricare i dati ai telefoni.
+- Un'attesa di 1-3 secondi per la conferma resta normale: è il tempo di risposta di Google Apps Script, non eliminabile.
+
+## Novità della versione 1.3 (sincronizzazione e grafica)
+- **Salvataggio immediato e affidabile**: completare o modificare aggiorna subito lo schermo. In background l'app invia **tutte le modifiche in attesa in una sola richiesta** (prima una per volta, con il server che ogni volta rileggeva l'intero foglio). Ogni modifica passa da tre stati: *in invio* → *confermata dal server* → *già presente nei dati letti*; solo le prime due si vedono sullo schermo come "provvisorie". Se il server rifiuta una modifica (per esempio due persone la cambiano insieme) lo dice chiaramente e mostra i dati aggiornati.
+- **Meno avvisi**: durante il normale invio compare solo "Salvataggio…" in alto. Il banner appare solo se il server tarda oltre 10 secondi, se sei offline o se una modifica viene rifiutata. Gli errori temporanei di rete vengono ritentati da soli (1,5 → 20 secondi) e senza duplicati: ogni modifica ha un identificativo e il server riconosce le ripetizioni. Le modifiche in sospeso si salvano anche se chiudi e riapri l'app. "Scarta" compare solo per modifiche rifiutate o ferme da oltre 10 minuti.
+- **Aggiornamenti tra telefoni**: mentre usi l'app il controllo avviene **ogni 6 secondi** (ogni 30 se non la tocchi da 2 minuti). Se non è cambiato nulla il server risponde subito leggendo una sola informazione; i dati completi si scaricano solo quando c'è una novità. Le risposte vecchie arrivate in ritardo vengono ignorate. **Non è un aggiornamento in tempo reale vero e proprio**: Google Apps Script non supporta notifiche push, quindi l'altra persona vede la modifica entro circa 6-10 secondi.
+- **Grafica**: palette originale (verde acqua) più armoniosa; schede più compatte con categoria in evidenza e data solo quando non è oggi; riepilogo settimanale su una riga per persona; filtro persona a pulsanti e due menu allineati; completamenti con segno di spunta pieno e testo attenuato; barra inferiore con icone e voce attiva evidenziata; stati vuoti, di caricamento, offline ed errore curati; focus visibile e rispetto delle preferenze di movimento ridotto.
+- **Aggiornamento obbligatorio del backend**: incolla il nuovo `backend/Code.gs` e ridistribuisci (*Distribuisci → Gestisci distribuzioni → matita → Nuova versione*). Se aggiorni solo l'app, comparirà il messaggio "Il server non è aggiornato" e le modifiche resteranno in coda senza perdersi. Va aggiornata anche l'app (nuovo APK; disinstalla prima il vecchio).
 
 ## Come funzionano alcune cose
 - **Offline**: Google Sheets non è un database offline. Senza rete l'app mostra l'ultima copia dei dati (sola lettura, con ora dell'ultimo aggiornamento). Le modifiche fatte restano in una **coda locale** marcata "in attesa" e **non sono considerate sincronizzate finché il server non conferma**. Puoi riprovare o scartarle dal banner.
@@ -84,6 +98,8 @@ Il workflow produce solo l'APK **debug**. Se un giorno vorrai una release firmat
 backend/Code.gs                 Google Apps Script
 src/                            frontend (index.html, styles.css, app.js)
 scripts/build.mjs               copia src/ → www/
+scripts/make-icons.py           genera le icone (facoltativo)
+resources/android/              icona scopa e splash, copiati nel progetto Android dalla build
 capacitor.config.json           configurazione Capacitor (webDir: www)
 tests/                          test backend (Sheets simulato) e test di fumo UI
 android/                        NON incluso: generato dalla build con `npx cap add android`
