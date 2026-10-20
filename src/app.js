@@ -33,32 +33,37 @@ let VIEW = null;
 /* Dati del server + modifiche ancora in coda applicate in modo PROVVISORIO (con badge "⏳"), così l'app risponde subito.
    Non vengono mai presentate come sincronizzate finché il server non conferma. */
 function buildView() {
-  const d = S.data || EMPTY, pend = S.outbox.filter(o => o.status === 'pending');
-  if (!pend.length) return d;
+  const d = S.data || EMPTY, live = S.outbox.filter(o => o.status === 'pending' || o.status === 'confirmed');
+  if (!live.length) return d;
   const v = Object.assign({}, d, { occurrences: d.occurrences.slice(), history: d.history.slice() });
-  pend.forEach(op => {
+  live.forEach(op => {
     const p = op.payload;
     if (op.action === 'completeOccurrence') {
       const o = v.occurrences.find(x => x.id === p.occurrenceId), t = o && d.tasks.find(x => x.id === o.taskId);
       if (o && t) {
         v.occurrences = v.occurrences.filter(x => x !== o);
-        if (!v.history.some(h => h.id === 'h_' + op.opId)) v.history.push({ id: 'h_' + op.opId, taskId: t.id, taskName: t.name, category: t.category, frequency: t.frequency, assignee: o.assignee || t.assignee, doneBy: p.doneBy, doneAt: p.doneAt, doneDate: p.doneDate, estMinutes: t.minutes, actualMinutes: p.actualMinutes === '' || p.actualMinutes == null ? '' : Number(p.actualMinutes), effort: t.effort, notes: p.notes || '', pending: true });
+        if (!v.history.some(h => h.id === 'h_' + op.opId)) v.history.push({ id: 'h_' + op.opId, taskId: t.id, taskName: t.name, category: t.category, frequency: t.frequency, assignee: o.assignee || t.assignee, doneBy: p.doneBy, doneAt: p.doneAt, doneDate: p.doneDate, estMinutes: t.minutes, actualMinutes: p.actualMinutes === '' || p.actualMinutes == null ? '' : Number(p.actualMinutes), effort: t.effort, notes: p.notes || '', pending: isLate(op) });
       }
     } else if (op.action === 'undoCompletion') v.history = v.history.filter(h => h.id !== p.historyId);
     else if (op.action === 'updateOccurrence') v.occurrences = v.occurrences.map(o => o.id === p.id ? Object.assign({}, o, p.dueDate !== undefined ? { dueDate: p.dueDate } : {}, p.assignee !== undefined ? { assignee: p.assignee } : {}) : o);
   });
   return v;
 }
+const isLate = op => op.status === 'pending' && Date.now() - op.ts > 8000; // "non ancora salvata" solo se il server tarda davvero
 const D = () => VIEW || (VIEW = buildView());
 const person = id => id === 'both' ? 'Entrambi' : id === 'none' || !id ? 'Non assegnata' : ((D().people.find(p => p.id === id) || {}).name || (id === 'p1' ? 'Persona 1' : 'Paola'));
 const taskOf = id => D().tasks.find(t => t.id === id);
 const eff = o => o.assignee || (taskOf(o.taskId) || {}).assignee || 'none';
 const setting = (k, d) => { const s = D().settings.find(x => x.id === k); return s ? s.value : d; };
 const openOccs = () => D().occurrences.filter(o => o.status === 'open' && taskOf(o.taskId));
-const pendingSet = () => new Set(S.outbox.map(o => o.payload.occurrenceId || o.payload.historyId || o.payload.id || (o.payload.task && o.payload.task.id)).filter(Boolean));
+const pendingSet = () => new Set(S.outbox.filter(isLate).map(o => o.payload.occurrenceId || o.payload.historyId || o.payload.id || (o.payload.task && o.payload.task.id)).filter(Boolean));
 const freqLabel = t => t.frequency === 'custom' ? 'Ogni ' + t.intervalDays + ' giorni' : FREQ[t.frequency];
 const opt = (v, l, cur) => '<option value="' + esc(v) + '"' + (String(v) === String(cur) ? ' selected' : '') + '>' + esc(l) + '</option>';
 const saveBox = () => LS.set('outbox', S.outbox);
+const IC = { today: '<circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/>', tasks: '<path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01"/>', cal: '<rect x="4" y="5" width="16" height="15" rx="3"/><path d="M8 3v4M16 3v4M4 10h16"/>', stats: '<path d="M5 20V11M12 20V4M19 20v-6"/>', settings: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>', plus: '<path d="M12 5v14M5 12h14"/>' };
+const svg = k => '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + IC[k] + '</svg>';
+const emptyState = (t, p, act, label) => '<div class="empty"><b>' + t + '</b><p>' + p + '</p>' + (act ? '<button class="btn primary" data-act="' + act + '">' + label + '</button>' : '') + '</div>';
+const loadingView = () => emptyState('Sto caricando…', 'Recupero mansioni e storico.');
 
 /* ---------- rete e sincronizzazione ---------- */
 async function api(action, payload, cfg) {
@@ -74,45 +79,65 @@ async function api(action, payload, cfg) {
   if (!j.ok) throw { code: j.code, message: j.message, snapshot: j.snapshot };
   return j;
 }
-function setSync(state, msg) { S.sync.state = state; S.sync.msg = msg || ''; render(); }
-function applySnap(snap) { S.data = snap; LS.set('data', snap); S.sync.last = new Date().toISOString(); LS.set('last', S.sync.last); S.sync.state = 'ok'; S.sync.msg = ''; }
+const BACKOFF = [1500, 3000, 6000, 12000, 20000];
+let flushing = false, syncing = false, fails = 0, retryTimer = null;
+function markSynced() { S.sync.last = new Date().toISOString(); LS.set('last', S.sync.last); S.sync.state = 'ok'; S.sync.msg = ''; fails = 0; }
+// Le modifiche "confermate" restano nella vista locale finché non arriva uno stato del server che le contiene (revisione >= conferma).
+function dropConfirmed(rev) { const r = Number(rev), n = S.outbox.length; S.outbox = S.outbox.filter(o => !(o.status === 'confirmed' && Number(o.ackRev) <= r)); if (S.outbox.length !== n) saveBox(); }
+function applySnap(snap) {
+  if (S.data && S.data.rev != null && snap.rev != null && Number(snap.rev) < Number(S.data.rev)) return; // risposta vecchia arrivata in ritardo: ignorata
+  S.data = snap; LS.set('data', snap); markSynced(); dropConfirmed(snap.rev);
+}
 function enqueue(action, payload, label) {
-  const op = { opId: uid('op'), action: action, payload: payload, label: label, status: 'pending', err: '' };
-  S.outbox.push(op); saveBox(); render(); flush();
+  const op = { opId: uid('op'), action: action, payload: payload, label: label, status: 'pending', err: '', ts: Date.now() };
+  S.outbox.push(op); saveBox(); render(); setTimeout(render, 8500); setTimeout(render, 10500); // rivaluta gli avvisi solo se il server tarda
+  sync(false);
   return op;
 }
-let flushing = false;
+function retryLater() { clearTimeout(retryTimer); retryTimer = setTimeout(() => sync(false), BACKOFF[Math.min(Math.max(fails, 1) - 1, BACKOFF.length - 1)]); }
+function handleFail(e, batch) {
+  fails++; batch.forEach(o => { o.err = e.message; });
+  if (e.code === 'bad_request' && /sconosciuta/i.test(e.message || '')) { S.sync.state = 'error'; S.sync.msg = 'Il server non è aggiornato: incolla il nuovo Code.gs in Apps Script e ridistribuisci (vedi README). Le modifiche restano in coda.'; return; }
+  if (e.code === 'auth' || e.code === 'locked' || e.code === 'not_configured') { S.sync.state = 'error'; S.sync.msg = e.message + (e.code === 'auth' ? ' Controlla il token in Impostazioni.' : ''); return; }
+  if (e.network || e.code === 'busy' || e.code === 'error') { if (fails >= 2) { S.sync.state = e.network ? 'offline' : 'error'; S.sync.msg = e.message; } retryLater(); return; } // errore temporaneo: riprova da solo, senza allarmare
+  batch.forEach(o => { o.status = 'conflict'; }); // richiesta rifiutata in blocco dal server
+}
 async function flush() {
-  if (flushing || !S.cfg.url) return;
-  flushing = true;
+  if (flushing || !S.cfg.url) return true;
+  flushing = true; let ok = true;
   try {
-    for (const op of S.outbox.slice()) {
-      if (op.status === 'conflict') continue;
-      try {
-        const r = await api(op.action, Object.assign({}, op.payload, { opId: op.opId }));
-        S.outbox = S.outbox.filter(x => x !== op); op.err = ''; applySnap(r.snapshot);
-      } catch (e) {
-        if (e.network) { op.err = e.message; S.sync.state = 'offline'; S.sync.msg = e.message; break; }
-        if (e.code === 'auth' || e.code === 'locked' || e.code === 'busy' || e.code === 'not_configured') { op.err = e.message; S.sync.state = 'error'; S.sync.msg = e.message; break; }
-        op.status = 'conflict'; op.err = e.message; if (e.snapshot) applySnap(e.snapshot);
-      }
+    for (;;) {
+      const batch = S.outbox.filter(o => o.status === 'pending');
+      if (!batch.length) break;
+      let r;
+      try { r = await api('batch', { ops: batch.map(o => ({ opId: o.opId, action: o.action, payload: o.payload })) }); } // più modifiche, una sola richiesta; l'opId evita doppioni se va ripetuta
+      catch (e) { handleFail(e, batch); ok = false; break; }
+      if (!Array.isArray(r.results)) { handleFail({ code: 'error', message: 'Risposta inattesa dal server.' }, batch); ok = false; break; }
+      fails = 0; if (S.sync.state === 'offline' || S.sync.state === 'error') { S.sync.state = 'ok'; S.sync.msg = ''; }
+      let progressed = false;
+      r.results.forEach(res => { const o = batch.find(x => x.opId === res.opId); if (!o) return; progressed = true;
+        if (res.ok) { o.status = 'confirmed'; o.ackRev = r.rev; o.err = ''; } else { o.status = 'conflict'; o.err = res.message; } });
+      saveBox(); render();
+      if (!progressed) break;
     }
   } finally { flushing = false; saveBox(); render(); }
+  return ok;
 }
-async function refresh(force) {
-  if (!S.cfg.url || !S.cfg.token) return;
-  const full = force || !S.data;
-  if (full) setSync('syncing');
-  const before = S.sync.last;
-  await flush();
-  if (S.outbox.some(o => o.status === 'pending')) { render(); return; } // ancora modifiche non confermate: non sovrascrivere la vista
-  if (S.sync.last !== before) { render(); return; } // la risposta alle scritture conteneva già i dati aggiornati
+async function pull(full, manual) {
+  if (!S.cfg.url || !S.cfg.token || syncing) return;
+  syncing = true; full = full || !S.data;
+  if (manual) { S.sync.state = 'syncing'; render(); }
   try {
-    // Controllo leggero: se la revisione non è cambiata il server risponde subito, senza dati.
-    const r = await api('sync', { rev: full ? null : S.data.rev });
-    if (r.unchanged) { S.sync.last = new Date().toISOString(); LS.set('last', S.sync.last); S.sync.state = 'ok'; S.sync.msg = ''; } else applySnap(r.snapshot);
-  } catch (e) { S.sync.state = e.network ? 'offline' : 'error'; S.sync.msg = e.message; }
-  render();
+    const r = await api('sync', { rev: full ? null : S.data.rev }); // se la revisione non è cambiata il server risponde subito, senza dati
+    if (r.unchanged) { markSynced(); dropConfirmed(r.rev); } else applySnap(r.snapshot);
+  } catch (e) {
+    fails++;
+    if (e.network) { if (fails >= 2 || manual) { S.sync.state = 'offline'; S.sync.msg = e.message; } } else { S.sync.state = 'error'; S.sync.msg = e.message; }
+  } finally { syncing = false; render(); }
+}
+async function sync(full, manual) {
+  if (!S.cfg.url || !S.cfg.token || flushing) return; // se sta già inviando, il ciclo in corso prende anche le nuove modifiche
+  if (await flush()) await pull(full, manual);
 }
 
 /* ---------- disponibilità ---------- */
@@ -130,7 +155,7 @@ function freeMin(pid, date) {
 
 /* ---------- UI di base ---------- */
 function toast(msg, undoId) { const t = $('#toast'); t.innerHTML = '<span>' + esc(msg) + '</span>' + (undoId ? '<button class="btn sm" data-act="undoNow" data-id="' + esc(undoId) + '">Annulla</button>' : ''); t.classList.remove('hid'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.add('hid'), undoId ? 7000 : 3200); }
-function sheet(html) { const s = $('#sheet'); s.innerHTML = '<div class="backdrop" data-act="closeSheet"></div><div class="panel">' + html + '<button class="btn ghost" data-act="closeSheet">Chiudi</button></div>'; s.classList.remove('hid'); }
+function sheet(html) { const s = $('#sheet'); s.innerHTML = '<div class="backdrop" data-act="closeSheet"></div><div class="panel"><div class="grab"></div>' + html + '<button class="btn ghost" data-act="closeSheet">Chiudi</button></div>'; s.classList.remove('hid'); }
 const closeSheet = () => { $('#sheet').classList.add('hid'); $('#sheet').innerHTML = ''; };
 const sheetOpen = () => !$('#sheet').classList.contains('hid');
 const val = n => { const el = $('#sheet [name="' + n + '"]'); return el ? el.value.trim() : ''; };
@@ -139,11 +164,12 @@ const segVal = n => { const b = $('#sheet .seg[data-name="' + n + '"] .on'); ret
 const people3 = () => [['p1', person('p1')], ['p2', person('p2')], ['both', 'Entrambi']];
 
 function chip() {
-  const s = S.sync, last = s.last ? fmtTime(s.last) : null;
-  if (s.state === 'syncing') return '<span class="chip">⟳ Sincronizzazione…</span>';
-  if (s.state === 'offline') return '<button class="chip bad" data-act="refresh">Offline' + (last ? ' · ultimo agg. ' + last : '') + '</button>';
-  if (s.state === 'error') return '<button class="chip bad" data-act="refresh">Errore · riprova</button>';
-  return '<button class="chip ' + (last ? 'ok' : '') + '" data-act="refresh">' + (last ? '✓ Sincronizzato ' + last : 'Mai sincronizzato') + ' ⟳</button>';
+  const st = S.sync, last = st.last ? fmtTime(st.last) : null;
+  if (st.state === 'syncing') return '<span class="chip">Aggiornamento…</span>';
+  if (st.state === 'offline') return '<button class="chip bad" data-act="refresh" aria-label="Offline, tocca per riprovare">Offline' + (last ? ' · ' + last : '') + '</button>';
+  if (st.state === 'error') return '<button class="chip bad" data-act="refresh" aria-label="Errore, tocca per riprovare">Errore</button>';
+  if (S.outbox.some(o => o.status === 'pending')) return '<span class="chip busy" role="status">Salvataggio…</span>';
+  return '<button class="chip ' + (last ? 'ok' : '') + '" data-act="refresh" aria-label="Aggiorna ora">' + (last ? 'Sincronizzato ' + last : 'Mai sincronizzato') + '</button>';
 }
 let lastMain = '';
 function render() {
@@ -151,35 +177,46 @@ function render() {
   const cfgd = S.cfg.url && S.cfg.token, main = $('#main'), ae = document.activeElement;
   const typing = ae && main.contains(ae) && /INPUT|TEXTAREA|SELECT/.test(ae.tagName);
   const titles = { today: 'Oggi', tasks: 'Mansioni', cal: 'Calendario', stats: 'Statistiche', settings: 'Impostazioni' };
-  $('#hdr').innerHTML = '<h1>' + (cfgd ? titles[S.tab] : 'Casa in Ordine') + '</h1>' + (cfgd ? chip() : '');
-  const bad = S.outbox.filter(o => o.status === 'conflict').length, pend = S.outbox.length - bad;
-  $('#banner').innerHTML = S.outbox.length ? '<div class="warn">' + (pend ? '⚠ ' + pend + ' modifica/e non ancora confermata/e dal server. ' : '') + (bad ? bad + ' non applicata/e. ' : '') + '<button class="btn sm" data-act="pending">Dettagli</button></div>' : '';
+  const dl = new Date().toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' });
+  $('#hdr').innerHTML = '<div><h1>' + (cfgd ? titles[S.tab] : 'Casa in Ordine') + '</h1>' + (cfgd && S.tab === 'today' ? '<div class="sub">' + dl + '</div>' : '') + '</div>' + (cfgd ? chip() : '');
+  // Avvisi solo quando servono: modifiche rifiutate, errori reali, oppure un salvataggio che tarda da più di 10 secondi / offline.
+  const pend = S.outbox.filter(o => o.status === 'pending'), bad = S.outbox.filter(o => o.status === 'conflict');
+  const slow = pend.some(o => Date.now() - o.ts > 10000), off = S.sync.state === 'offline', nb = [];
+  if (bad.length) nb.push('<div class="warn"><span>' + bad.length + (bad.length === 1 ? ' modifica non è stata applicata.' : ' modifiche non sono state applicate.') + '</span><button class="btn sm" data-act="pending">Dettagli</button></div>');
+  if (cfgd && S.sync.state === 'error') nb.push('<div class="warn"><span>' + esc(S.sync.msg || 'Qualcosa è andato storto.') + '</span><button class="btn sm" data-act="refresh">Riprova</button></div>');
+  else if (cfgd && pend.length && (slow || off)) nb.push('<div class="warn"><span>' + pend.length + (pend.length === 1 ? ' modifica non ancora salvata' : ' modifiche non ancora salvate') + (off ? ': sei offline, riprovo da solo.' : ': sto riprovando.') + '</span><button class="btn sm" data-act="pending">Dettagli</button></div>');
+  else if (cfgd && off && S.data) nb.push('<div class="warn info"><span>Sei offline: stai vedendo l\'ultima copia dei dati.</span><button class="btn sm" data-act="refresh">Riprova</button></div>');
+  $('#banner').innerHTML = nb.join('');
   $('#nav').style.display = cfgd ? '' : 'none';
-  $('#nav').innerHTML = [['today', '✓', 'Oggi'], ['tasks', '☰', 'Mansioni'], ['cal', '▦', 'Calendario'], ['stats', '◔', 'Statistiche'], ['settings', '⚙', 'Impostazioni']]
-    .map(t => '<button data-act="tab" data-id="' + t[0] + '" class="' + (S.tab === t[0] ? 'on' : '') + '"><b>' + t[1] + '</b>' + t[2] + '</button>').join('');
+  $('#nav').innerHTML = [['today', 'Oggi'], ['tasks', 'Mansioni'], ['cal', 'Calendario'], ['stats', 'Statistiche'], ['settings', 'Impostazioni']]
+    .map(t => '<button data-act="tab" data-id="' + t[0] + '" class="' + (S.tab === t[0] ? 'on' : '') + '"' + (S.tab === t[0] ? ' aria-current="page"' : '') + '><i class="ni">' + svg(t[0]) + '</i>' + t[1] + '</button>').join('');
   if (typing && !S.force) return; // non cancellare ciò che l'utente sta scrivendo
-  const sc = main.scrollTop;
-  main.innerHTML = cfgd ? view() : setupView();
-  main.scrollTop = sc;
+  const html = cfgd ? view() : setupView();
+  if (html !== lastMain) { const sc = main.scrollTop; main.innerHTML = html; main.scrollTop = sc; lastMain = html; } // niente ridisegni inutili: la schermata cambia solo se cambia il contenuto
 }
-function view() { return ({ today: todayView, tasks: tasksView, cal: calView, stats: statsView, settings: settingsView }[S.tab] || todayView)(); }
+function view() { if (!S.data) return loadingView(); return ({ today: todayView, tasks: tasksView, cal: calView, stats: statsView, settings: settingsView }[S.tab] || todayView)(); }
 
 /* ---------- Oggi ---------- */
 const pm = a => S.f.person === 'all' || a === S.f.person || (a === 'both' && (S.f.person === 'p1' || S.f.person === 'p2'));
 function filters(kind) {
-  const sel = (k, o) => '<select data-f="' + k + '" aria-label="Filtro ' + k + '">' + o.map(x => opt(x[0], x[1], S.f[k])).join('') + '</select>';
-  return '<div class="filters">' + sel('person', [['all', 'Tutti'], ['p1', person('p1')], ['p2', person('p2')], ['none', 'Non assegnate']]) +
-    sel('cat', [['all', 'Categorie']].concat(CATS.map(c => [c, c]))) +
-    (kind === 'today' ? sel('due', [['all', 'Scadenze'], ['overdue', 'Scadute'], ['today', 'Oggi'], ['week', '7 giorni']]) : kind === 'hist' ? '' : sel('status', [['active', 'Attive'], ['archived', 'Archiviate'], ['all', 'Tutte']])) + '</div>';
+  const f = S.f, sel = (k, o) => '<select data-f="' + k + '" aria-label="' + esc(o[0][1]) + '">' + o.map(x => opt(x[0], x[1], f[k])).join('') + '</select>';
+  const who = [['all', 'Tutti'], ['p1', person('p1')], ['p2', person('p2')]].concat(kind === 'hist' ? [] : [['none', 'Da assegnare']]);
+  const pf = kind === 'hist' && f.person === 'none' ? 'all' : f.person;
+  const segp = '<div class="seg sm" role="group" aria-label="Persona">' + who.map(x => '<button type="button" data-act="fperson" data-id="' + x[0] + '" class="' + (pf === x[0] ? 'on' : '') + '" aria-pressed="' + (pf === x[0]) + '">' + esc(x[1]) + '</button>').join('') + '</div>';
+  const cat = sel('cat', [['all', 'Tutte le categorie']].concat(CATS.map(c => [c, c])));
+  const third = kind === 'today' ? sel('due', [['all', 'Tutte le scadenze'], ['overdue', 'Scadute'], ['today', 'Oggi'], ['week', '7 giorni']]) : kind === 'hist' ? '' : sel('status', [['active', 'Attive'], ['archived', 'Archiviate'], ['all', 'Tutte']]);
+  return '<div class="filters">' + segp + '<div class="fsel' + (third ? '' : ' one') + '">' + cat + third + '</div></div>';
 }
 function occCard(o, pend) {
-  const t = taskOf(o.taskId), late = o.dueDate < today();
-  return '<div class="card occ ' + (late ? 'late' : '') + '" data-act="occ" data-id="' + o.id + '"><div class="grow"><b>' + esc(t.name) + '</b><div class="meta">' + esc(t.category) + ' · ' + esc(person(eff(o))) + ' · ' + t.minutes + ' min · ' + (late ? 'scaduta, ' : '') + fmtDay(o.dueDate) + '</div>' +
-    (pend.has(o.id) ? '<span class="badge">⏳ in attesa di conferma</span>' : '') + '</div><button class="done" data-act="done" data-id="' + o.id + '" aria-label="Completa">✓</button></div>';
+  const t = taskOf(o.taskId), late = o.dueDate < today(), parts = [esc(person(eff(o))), t.minutes + ' min'];
+  if (late) parts.push('<span class="lt">Scaduta ' + fmtDay(o.dueDate) + '</span>'); else if (o.dueDate !== today()) parts.push(fmtDay(o.dueDate)); // la data si indica solo quando non è oggi
+  return '<div class="card occ" data-act="occ" data-id="' + o.id + '"><div class="grow"><b>' + esc(t.name) + '</b><div class="meta"><span class="tag">' + esc(t.category) + '</span>' + parts.join(' · ') + '</div>' +
+    (pend.has(o.id) ? '<span class="badge">Non ancora salvata</span>' : '') + '</div><button class="done" data-act="done" data-id="' + o.id + '" aria-label="Completa ' + esc(t.name) + '">✓</button></div>';
 }
 function weekSummary() {
   const ws = weekStart(today()), a = agg(hist(ws, addD(ws, 6))), left = openOccs().filter(o => o.dueDate <= addD(ws, 6)).length;
-  return '<div class="card"><h3>Questa settimana</h3><div class="row2">' + ['p1', 'p2'].map(p => '<div class="pill"><b>' + esc(person(p)) + '</b><br>' + r1(a[p].n) + ' completate · ' + r0(a[p].est) + ' min</div>').join('') + '</div><div class="meta" style="margin-top:8px">Ancora da fare entro domenica: ' + left + '</div></div>';
+  const col = p => '<div class="who"><i style="background:var(--' + p + ')"></i><div><b>' + esc(person(p)) + '</b><div class="meta">' + r1(a[p].n) + (a[p].n === 1 ? ' fatta · ' : ' fatte · ') + r0(a[p].est) + ' min</div></div></div>';
+  return '<div class="card sum"><div class="sum-h"><span>Questa settimana</span><span>' + left + ' da fare</span></div><div class="row2">' + col('p1') + col('p2') + '</div></div>';
 }
 function todayView() {
   const t = today(), pend = pendingSet();
@@ -188,12 +225,12 @@ function todayView() {
   const show = k => S.f.due === 'all' || S.f.due === k;
   const sec = (title, arr, k) => show(k) && arr.length ? '<h3>' + title + ' (' + arr.length + ')</h3>' + arr.sort(by).map(o => occCard(o, pend)).join('') : '';
   const html = sec('Scadute', L.filter(o => o.dueDate < t), 'overdue') + sec('Oggi', L.filter(o => o.dueDate === t), 'today') + sec('Prossime scadenze', L.filter(o => o.dueDate > t && o.dueDate <= addD(t, 7)), 'week');
-  return weekSummary() + filters('today') + (html || '<p class="empty">Nessuna mansione da mostrare con questi filtri.</p>') + doneToday();
+  return weekSummary() + filters('today') + (html || emptyState('Tutto in ordine', 'Nessuna mansione da fare con questi filtri.')) + doneToday();
 }
 function histCard(h) {
   const min = h.actualMinutes !== '' && h.actualMinutes != null ? h.actualMinutes + ' min effettivi' : h.estMinutes + ' min stimati';
-  return '<div class="card occ"><div class="grow"><b>✓ ' + esc(h.taskName) + '</b><div class="meta">' + esc(h.category) + ' · ' + esc(person(h.doneBy)) + ' · ' + fmtDay(h.doneDate) + ' ' + fmtTime(h.doneAt) + ' · ' + min + (h.notes ? ' · ' + esc(h.notes) : '') + '</div>' +
-    (h.pending ? '<span class="badge">⏳ in attesa di conferma</span>' : '') + '</div><button class="btn sm" data-act="undo" data-id="' + esc(h.id) + '">Annulla</button></div>';
+  return '<div class="card occ dn"><span class="ck" aria-hidden="true">✓</span><div class="grow"><b>' + esc(h.taskName) + '</b><div class="meta"><span class="tag">' + esc(h.category) + '</span>' + esc(person(h.doneBy)) + ' · ' + fmtDay(h.doneDate) + ' ' + fmtTime(h.doneAt) + ' · ' + min + (h.notes ? ' · ' + esc(h.notes) : '') + '</div>' +
+    (h.pending ? '<span class="badge">Non ancora salvata</span>' : '') + '</div><button class="btn sm" data-act="undo" data-id="' + esc(h.id) + '">Annulla</button></div>';
 }
 function doneToday() {
   const t = today(), L = D().history.filter(h => h.doneDate === t).sort((a, b) => String(b.doneAt).localeCompare(String(a.doneAt)));
@@ -214,10 +251,15 @@ function completeSheet(id) {
 function tasksView() {
   const opens = openOccs(), pend = pendingSet();
   const L = D().tasks.filter(t => (S.f.status === 'all' || t.status === S.f.status) && (S.f.cat === 'all' || t.category === S.f.cat) && pm(t.assignee)).sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
-  return filters('tasks') + (L.map(t => { const o = opens.find(x => x.taskId === t.id);
-    return '<div class="card" data-act="task" data-id="' + t.id + '"><b>' + esc(t.name) + '</b> ' + (t.status === 'archived' ? '<span class="badge">archiviata</span>' : '') + (pend.has(t.id) ? '<span class="badge">⏳</span>' : '') +
-      '<div class="meta">' + esc(t.category) + ' · ' + esc(person(t.assignee)) + ' · ' + esc(freqLabel(t)) + ' · ' + t.minutes + ' min · impegno ' + t.effort + '/5 · ' + (o ? 'scade ' + fmtDay(o.dueDate) : 'nessuna scadenza') + '</div></div>'; }).join('') || '<p class="empty">Nessuna mansione.</p>') +
-    '<button class="fab" data-act="newTask" aria-label="Nuova mansione">＋</button>';
+  let last = '', html = '';
+  L.forEach(t => {
+    if (t.category !== last) { last = t.category; html += '<h3>' + esc(last) + '</h3>'; }
+    const o = opens.find(x => x.taskId === t.id);
+    html += '<div class="card" data-act="task" data-id="' + t.id + '"><b>' + esc(t.name) + '</b> ' + (t.status === 'archived' ? '<span class="badge">archiviata</span>' : '') + (pend.has(t.id) ? '<span class="badge">Non ancora salvata</span>' : '') +
+      '<div class="meta">' + esc(person(t.assignee)) + ' · ' + esc(freqLabel(t)) + ' · ' + t.minutes + ' min · ' + (o ? 'scade ' + fmtDay(o.dueDate) : 'nessuna scadenza') + '</div></div>';
+  });
+  return filters('tasks') + (html || emptyState('Nessuna mansione', 'Aggiungi la prima mansione della casa.', 'newTask', 'Aggiungi mansione')) +
+    '<div class="spacer"></div><button class="fab" data-act="newTask">' + svg('plus') + 'Nuova mansione</button>';
 }
 function taskSheet(id) {
   const t = id ? taskOf(id) : null, occ = t ? openOccs().find(o => o.taskId === t.id) : null;
@@ -260,7 +302,7 @@ function calView() {
     const over = ['p1', 'p2'].some(p => load[p] > freeMin(p, d).cap);
     html += '<div class="card day ' + (d === t ? 'today' : '') + (over ? ' over' : '') + '"><b>' + fmtDay(d) + '</b>' + (over ? ' <span class="badge" style="background:var(--warnl);color:var(--warn)">giornata carica</span>' : '') +
       '<div class="meta">' + ['p1', 'p2'].map(p => esc(person(p)) + ' ' + r0(load[p]) + '/' + freeMin(p, d).cap + ' min').join(' · ') + (load.none ? ' · da assegnare ' + r0(load.none) + ' min' : '') + '</div>' +
-      items.map(o => '<div class="it" data-act="occ" data-id="' + o.id + '"><span>' + esc(taskOf(o.taskId).name) + (pend.has(o.id) ? ' ⏳' : '') + '</span><span class="meta">' + esc(person(eff(o))) + ' · ' + taskOf(o.taskId).minutes + '′</span></div>').join('') + '</div>';
+      items.map(o => '<div class="it" data-act="occ" data-id="' + o.id + '"><span>' + esc(taskOf(o.taskId).name) + (pend.has(o.id) ? ' (non ancora salvata)' : '') + '</span><span class="meta">' + esc(person(eff(o))) + ' · ' + taskOf(o.taskId).minutes + '′</span></div>').join('') + '</div>';
   }
   return html + '<p class="note">Il carico è confrontato con i minuti disponibili al giorno (disponibilità dichiarata, con il tetto giornaliero impostato in Impostazioni). Sono indicazioni, non obblighi.</p>';
 }
@@ -337,7 +379,8 @@ function balView(from, to) {
   return out;
 }
 function histView() {
-  const all = D().history.filter(h => pm(h.doneBy) && (S.f.cat === 'all' || h.category === S.f.cat)).sort((a, b) => String(b.doneAt).localeCompare(String(a.doneAt)));
+  const pf = S.f.person === 'none' ? 'all' : S.f.person;
+  const all = D().history.filter(h => (pf === 'all' || h.doneBy === pf || h.doneBy === 'both') && (S.f.cat === 'all' || h.category === S.f.cat)).sort((a, b) => String(b.doneAt).localeCompare(String(a.doneAt)));
   return filters('hist') + '<button class="btn" data-act="exportCsv">Esporta CSV (condividi o copia)</button>' + (all.slice(0, 150).map(histCard).join('') || '<p class="empty">Nessun completamento con questi filtri.</p>') +
     (all.length > 150 ? '<p class="meta">Mostrati gli ultimi 150 di ' + all.length + '; il CSV contiene tutto.</p>' : '') + '<p class="meta">Hai sbagliato a completare? Tocca "Annulla": l\'attività torna da fare e sparisce dalle statistiche.</p>';
 }
@@ -364,7 +407,7 @@ function settingsView() {
     '<label>Tetto giornaliero di tempo per la casa (minuti)<input name="cap" type="number" min="0" max="1440" value="' + esc(setting('dailyCapMin', 120)) + '"></label><button class="btn" data-act="saveGeneral">Salva</button></div>' +
     '<h3>Disponibilità e lavoro</h3><p class="meta">Essere a casa non significa essere liberi: inserisci orari di lavoro, impegni ricorrenti, fasce libere e giorni di indisponibilità.</p>' +
     ['p1', 'p2'].map(p => '<div class="meta"><b>' + esc(person(p)) + '</b></div>' + av(p) + '<button class="btn sm" data-act="availNew" data-id="' + p + '">+ Aggiungi per ' + esc(person(p)) + '</button>').join('<br><br>') +
-    '<h3>Dati e dispositivo</h3><button class="btn" data-act="refresh">Aggiorna ora</button><button class="btn danger" data-act="logout">Rimuovi configurazione da questo telefono</button><p class="meta">Versione 1.1.0 · controllo automatico ogni 20 secondi quando l\'app è aperta.</p>';
+    '<h3>Dati e dispositivo</h3><button class="btn" data-act="refresh">Aggiorna ora</button><button class="btn danger" data-act="logout">Rimuovi configurazione da questo telefono</button><p class="meta">Versione 1.3.0 · le modifiche degli altri compaiono entro circa 6 secondi mentre usi l\'app.</p>';
 }
 function availSheet(id, pid) {
   const a = id ? D().availability.find(x => x.id === id) : { personId: pid || 'p1', type: 'lavoro', weekdays: '1,2,3,4,5', start: '09:00', end: '18:00', dateFrom: today(), dateTo: today(), label: '' };
@@ -377,14 +420,16 @@ function availSheet(id, pid) {
     '<label>Etichetta (facoltativa)<input name="label" value="' + esc(a.label) + '" maxlength="60"></label><button class="btn primary" data-act="saveAvail" data-id="' + (id || '') + '">Salva</button>' + (id ? '<button class="btn danger" data-act="delAvail" data-id="' + id + '">Elimina</button>' : ''));
 }
 function pendingSheet() {
-  sheet('<h2>Modifiche in sospeso</h2>' + (S.outbox.map((o, i) => '<div class="card"><b>' + esc(o.label) + '</b><div class="meta">' + (o.status === 'conflict' ? 'Non applicata: ' + esc(o.err) : 'In attesa di conferma dal server' + (o.err ? ' (' + esc(o.err) + ')' : '')) + '</div><button class="btn sm" data-act="discard" data-id="' + i + '">Scarta</button></div>').join('') || '<p>Nessuna.</p>') +
-    '<p class="meta">Una modifica compare come sincronizzata solo dopo la conferma del server. Se resta in attesa, controlla la connessione e riprova.</p><button class="btn primary" data-act="retry">Riprova ora</button>');
+  const L = S.outbox.filter(o => o.status !== 'confirmed');
+  sheet('<h2>Salvataggio</h2>' + (L.map(o => { const bad = o.status === 'conflict', old = Date.now() - o.ts > 600000;
+    return '<div class="card"><b>' + esc(o.label) + '</b><div class="meta">' + (bad ? 'Non applicata: ' + esc(o.err) : 'Invio in corso' + (o.err ? ' · nuovo tentativo automatico (' + esc(o.err) + ')' : '')) + '</div>' + (bad || old ? '<button class="btn sm" data-act="discard" data-id="' + esc(o.opId) + '" style="margin-top:8px">Scarta</button>' : '') + '</div>'; }).join('') || '<p>Tutto salvato sul server.</p>') +
+    '<p class="meta">Le modifiche in attesa vengono inviate da sole appena possibile e non si duplicano.</p><button class="btn primary" data-act="retry">Riprova ora</button>');
 }
-
 /* ---------- azioni ---------- */
 const ACT = {
   tab(el, id) { S.tab = id; render(); $('#main').scrollTop = 0; },
-  refresh() { refresh(true); },
+  refresh() { sync(true, true); },
+  fperson(el, id) { S.f.person = id; render(); },
   done(el, id, e) { e.stopPropagation(); completeSheet(id); },
   occ(el, id) { occSheet(id); },
   seg(el) { Array.from(el.parentNode.children).forEach(b => b.classList.remove('on')); el.classList.add('on'); },
@@ -422,8 +467,8 @@ const ACT = {
   propose() { proposeSheet(); },
   applyProposal() {
     const boxes = Array.from(document.querySelectorAll('#sheet input[data-i]:checked')); if (!boxes.length) return closeSheet();
-    boxes.forEach(b => { const p = proposal[Number(b.dataset.i)]; S.outbox.push({ opId: uid('op'), action: 'updateOccurrence', payload: { id: p.id, baseVersion: p.version, assignee: p.to }, label: 'Assegna «' + p.name + '» a ' + person(p.to), status: 'pending', err: '' }); });
-    saveBox(); closeSheet(); render(); flush();
+    boxes.forEach(b => { const p = proposal[Number(b.dataset.i)]; S.outbox.push({ opId: uid('op'), action: 'updateOccurrence', payload: { id: p.id, baseVersion: p.version, assignee: p.to }, label: 'Assegna «' + p.name + '» a ' + person(p.to), status: 'pending', err: '', ts: Date.now() }); });
+    saveBox(); closeSheet(); render(); sync(false);
   },
   allDone() { S.tab = 'stats'; S.stats.view = 'hist'; render(); $('#main').scrollTop = 0; },
   undo(el, id) { const h = D().history.find(x => x.id === id); if (!h) return; if (!confirm('Annullare il completamento di «' + h.taskName + '»? L\'attività tornerà da fare e sparirà dalle statistiche.')) return; enqueue('undoCompletion', { historyId: id }, 'Annulla completamento «' + h.taskName + '»'); },
@@ -439,7 +484,7 @@ const ACT = {
     if (!/^https:\/\/script\.google\.com\//.test(url) || !/\/exec$/.test(url)) return toast('L\'URL deve iniziare con https://script.google.com/ e finire con /exec');
     if (token.length < 24) return toast('Token troppo corto.');
     toast('Verifica in corso…');
-    try { const r = await api('ping', {}, { url: url, token: token }); S.cfg = { url: url, token: token, me: r.user }; LS.set('cfg', S.cfg); S.tab = 'today'; toast('Connesso come ' + (r.user === 'p1' ? 'Persona 1' : 'Persona 2')); render(); refresh(true); }
+    try { const r = await api('ping', {}, { url: url, token: token }); S.cfg = { url: url, token: token, me: r.user }; LS.set('cfg', S.cfg); S.tab = 'today'; toast('Connesso come ' + (r.user === 'p1' ? 'Persona 1' : 'Persona 2')); render(); sync(true, true); }
     catch (e) { toast(e.message || 'Errore di connessione'); }
   },
   savePeople() { [['p1', 'n1'], ['p2', 'n2']].forEach(x => { const n = val0(x[1]), cur = D().people.find(p => p.id === x[0]); if (n && (!cur || cur.name !== n)) enqueue('savePerson', { id: x[0], name: n, baseVersion: cur ? cur.version : 0 }, 'Nome ' + n); }); },
@@ -453,8 +498,8 @@ const ACT = {
   },
   delAvail(el, id) { const a = D().availability.find(x => x.id === id); if (!confirm('Eliminare questa disponibilità?')) return; enqueue('deleteAvailability', { id: id, baseVersion: a.version }, 'Elimina disponibilità'); closeSheet(); },
   pending() { pendingSheet(); },
-  retry() { closeSheet(); refresh(true); },
-  discard(el, id) { S.outbox.splice(Number(id), 1); saveBox(); render(); pendingSheet(); },
+  retry() { closeSheet(); sync(true, true); },
+  discard(el, id) { S.outbox = S.outbox.filter(o => o.opId !== id); saveBox(); render(); pendingSheet(); },
   logout() { if (!confirm('Rimuovere URL, token e dati locali da questo telefono? Le modifiche non ancora confermate andranno perse.')) return; ['cfg', 'data', 'outbox', 'last'].forEach(k => localStorage.removeItem(k)); S.cfg = { url: '', token: '', me: '' }; S.data = null; S.outbox = []; S.sync = { state: 'idle', last: null, msg: '' }; render(); }
 };
 const val0 = n => { const el = document.querySelector('#main [name="' + n + '"]'); return el ? el.value.trim() : ''; };
@@ -472,9 +517,12 @@ document.addEventListener('change', e => {
 const AppPlugin = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
 if (AppPlugin) AppPlugin.addListener('backButton', () => { if (sheetOpen()) closeSheet(); else if (S.tab !== 'today') { S.tab = 'today'; S.force = true; render(); S.force = false; } else AppPlugin.exitApp(); });
 
-let ticks = 0;
-setInterval(() => { if (!document.hidden) refresh(++ticks % 15 === 0); }, 20000); // controllo leggero ogni 20 s, scarico completo ogni 5 minuti
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
-window.addEventListener('online', () => refresh());
-render(); refresh(true);
+S.outbox.forEach(o => { o.ts = o.ts || Date.now(); }); // modifiche rimaste in coda alla chiusura: vengono reinviate (l'opId evita doppioni)
+let lastTouch = Date.now(), ticks = 0;
+['touchstart', 'click', 'keydown'].forEach(t => document.addEventListener(t, () => { lastTouch = Date.now(); }, { passive: true }));
+// Controllo leggero ogni 6 s mentre usi l'app (ogni 30 s se non la tocchi da 2 minuti); scarico completo ogni ~5 minuti.
+(function loop() { setTimeout(async () => { if (!document.hidden) { ticks++; await sync(ticks % 50 === 0); } loop(); }, Date.now() - lastTouch < 120000 ? 6000 : 30000); })();
+document.addEventListener('visibilitychange', () => { if (!document.hidden) sync(false); });
+window.addEventListener('online', () => sync(false));
+render(); sync(false);
 })();
