@@ -3,7 +3,7 @@
  * Autenticazione: token segreti per persona, salvati nelle Proprietà dello script
  * (mai nel codice, mai nell'APK). Vedi README.
  */
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.3.0';
 
 const COLS = {
   tasks: ['id', 'name', 'description', 'category', 'assignee', 'frequency', 'intervalDays', 'minutes', 'effort', 'priority', 'status', 'notes', 'checklist', 'createdBy', 'createdAt', 'updatedAt', 'version', 'deleted'],
@@ -130,15 +130,15 @@ function same_(a, b) {
   return d === 0;
 }
 function auth_(token, props) {
-  const cache = CacheService.getScriptCache();
-  if (Number(cache.get('fails') || 0) >= 10) throw fail_('locked', 'Troppi tentativi errati. Riprova tra 10 minuti.');
   const t1 = props.TOKEN_P1, t2 = props.TOKEN_P2;
   if (!t1 || !t2) throw fail_('not_configured', 'Token non configurati: esegui generaTokenAccesso nello Script.');
   const tok = String(token || '');
   const m1 = same_(tok, t1), m2 = same_(tok, t2);
   if (m1) return 'p1';
   if (m2) return 'p2';
-  cache.put('fails', String(Number(cache.get('fails') || 0) + 1), 600);
+  const cache = CacheService.getScriptCache(), n = Number(cache.get('fails') || 0);
+  if (n >= 10) throw fail_('locked', 'Troppi tentativi errati. Riprova tra 10 minuti.');
+  cache.put('fails', String(n + 1), 600);
   throw fail_('auth', 'Token non valido.');
 }
 
@@ -177,22 +177,47 @@ function bumpRev_() { const p = PropertiesService.getScriptProperties(), r = Str
 /** Da eseguire dall'editor se modifichi il foglio a mano: forza i telefoni a riscaricare tutto. */
 function forzaAggiornamento() { bumpRev_(); Logger.log('I telefoni riscaricheranno i dati al prossimo aggiornamento.'); }
 
+function idsOf_(key) {
+  const sh = sheet_(key), n = sh.getLastRow(), set = {};
+  if (n >= 2) sh.getRange(2, 1, n - 1, 1).getValues().forEach(r => { set[String(r[0])] = 1; });
+  return set;
+}
 function route_(req, user, props) {
   if (req.action === 'ping') return { ok: true, user: user, version: APP_VERSION };
   if (req.action === 'sync') {
     let rev = props.REV || '0';
+    if (req.rev != null && String(req.rev) === rev) return { ok: true, unchanged: true, rev: rev }; // nessuna novità: una sola lettura, risposta immediata
     if (sheet_('people').getLastRow() < 2) { lock_(seed_); rev = getRev_(); }
-    if (req.rev != null && String(req.rev) === String(rev)) return { ok: true, unchanged: true, rev: rev }; // nessuna novità: risposta immediata
-    return { ok: true, snapshot: cachedSnapshot_(rev) };
+    return { ok: true, snapshot: cachedSnapshot_(rev, false) };
   }
-  const fn = WRITES[req.action];
+  if (req.action === 'batch') { // più modifiche in una sola richiesta, un solo lock, una sola risposta leggera
+    const ops = Array.isArray(req.ops) ? req.ops.slice(0, 30) : [];
+    return lock_(() => {
+      const seen = idsOf_('ops'), results = [], done = [];
+      ops.forEach(o => {
+        const id = String(o && o.opId || '');
+        if (id.length < 8 || !WRITES[o.action]) { results.push({ opId: id, ok: false, code: 'bad_request', message: 'Operazione non valida.' }); return; }
+        if (seen[id]) { results.push({ opId: id, ok: true, duplicate: true }); return; } // già applicata (ripetizione di una richiesta): nessun doppione
+        try {
+          WRITES[o.action](Object.assign({}, o.payload, { opId: id }), user);
+          seen[id] = 1; done.push({ id: id, action: o.action, at: iso_() }); results.push({ opId: id, ok: true });
+        } catch (err) {
+          results.push({ opId: id, ok: false, code: err.code || 'error', message: err.code ? err.message : 'Errore del server: ' + err.message });
+        }
+      });
+      appendMany_('ops', done);
+      return { ok: true, rev: done.length ? bumpRev_() : getRev_(), results: results };
+    });
+  }
+  const fn = WRITES[req.action]; // singole operazioni (compatibilità con le versioni precedenti dell'app)
   if (!fn) throw fail_('bad_request', 'Azione sconosciuta.');
   if (!req.opId || String(req.opId).length < 8) throw fail_('bad_request', 'opId mancante.');
   return lock_(() => {
-    if (rowOf_('ops', req.opId)) return { ok: true, duplicate: true, snapshot: cachedSnapshot_(getRev_()) }; // idempotenza
+    if (rowOf_('ops', req.opId)) return { ok: true, duplicate: true, snapshot: cachedSnapshot_(getRev_(), true) };
     fn(req, user);
     appendMany_('ops', [{ id: req.opId, action: req.action, at: iso_() }]);
-    return { ok: true, snapshot: cachedSnapshot_(bumpRev_()) };
+    bumpRev_();
+    return { ok: true, snapshot: cachedSnapshot_(getRev_(), true) };
   });
 }
 function snapshot_(rev) {
@@ -209,7 +234,7 @@ function snapshot_(rev) {
   };
 }
 /** Istantanea in cache per revisione: le letture dal foglio sono lente, la cache no. */
-function cachedSnapshot_(rev) {
+function cachedSnapshot_(rev, locked) {
   const c = CacheService.getScriptCache(), n = Number(c.get('sn:' + rev) || 0);
   if (n) {
     const keys = []; for (let i = 0; i < n; i++) keys.push('sp:' + rev + ':' + i);
@@ -217,13 +242,16 @@ function cachedSnapshot_(rev) {
     keys.forEach(k => { if (got[k] == null) ok = false; else txt += got[k]; });
     if (ok) { try { return JSON.parse(txt); } catch (e) { /* ricostruisci */ } }
   }
-  const snap = snapshot_(rev);
-  try {
-    const txt = JSON.stringify(snap), parts = {}; let k = 0;
-    for (let i = 0; i < txt.length; i += 30000) parts['sp:' + rev + ':' + (k++)] = txt.slice(i, i + 30000);
-    if (k <= 200) { parts['sn:' + rev] = String(k); c.putAll(parts, 21600); }
-  } catch (e) { /* la cache è solo un'ottimizzazione */ }
-  return snap;
+  const build = () => {
+    const cur = getRev_(), snap = snapshot_(cur); // dati coerenti: nessuna scrittura può avvenire durante la lettura
+    try {
+      const txt = JSON.stringify(snap), parts = {}; let k = 0;
+      for (let i = 0; i < txt.length; i += 30000) parts['sp:' + cur + ':' + (k++)] = txt.slice(i, i + 30000);
+      if (k <= 200) { parts['sn:' + cur] = String(k); c.putAll(parts, 21600); }
+    } catch (e) { /* la cache è solo un'ottimizzazione */ }
+    return snap;
+  };
+  return locked ? build() : lock_(build);
 }
 
 /* ---------- operazioni di scrittura (sempre sotto lock) ---------- */
