@@ -29,7 +29,9 @@ const ctx = {
   Logger: { log() {} }, console
 };
 vm.createContext(ctx);
-vm.runInContext(fs.readFileSync(__dirname + '/../backend/Code.gs', 'utf8'), ctx);
+const bdir = __dirname + '/../backend', bfile = fs.readdirSync(bdir).find(f => /^code\.gs(\.txt)?$/i.test(f));
+assert(bfile, 'File del backend non trovato in backend/ (atteso Code.gs)');
+vm.runInContext(fs.readFileSync(bdir + '/' + bfile, 'utf8'), ctx);
 
 const call = (token, action, p = {}) => JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(Object.assign({ token, action }, p)) } }));
 const ymd = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
